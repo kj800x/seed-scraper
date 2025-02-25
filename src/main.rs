@@ -304,43 +304,31 @@ enum RelativeTiming {
 }
 
 fn extract_weeks_pattern(text: &str) -> Option<SowingTime> {
-    let before_re = regex::Regex::new(
-        r"(\d+)\s*to\s*(\d+)\s*weeks\s*(before)\s*(your average last frost date|transplanting)",
+    let re = regex::Regex::new(
+        r"(\d+)\s*to\s*(\d+)\s*weeks\s*(before|after)\s*(your average last frost date|transplanting)",
     )
     .unwrap();
 
-    let after_re = regex::Regex::new(
-        r"(\d+)\s*to\s*(\d+)\s*weeks\s*(after)\s*(your average last frost date|transplanting)",
-    )
-    .unwrap();
-
-    if let Some(cap) = before_re.captures(text) {
+    re.captures(text).and_then(|cap| {
         let timing_type = match cap.get(4).unwrap().as_str() {
             "your average last frost date" => TimingType::LastFrost,
             "transplanting" => TimingType::Transplant,
             _ => return None,
         };
-        Some(SowingTime {
-            weeks_min: cap.get(1).unwrap().as_str().parse().unwrap(),
-            weeks_max: cap.get(2).unwrap().as_str().parse().unwrap(),
-            relative_timing: RelativeTiming::Before,
-            timing_type,
-        })
-    } else if let Some(cap) = after_re.captures(text) {
-        let timing_type = match cap.get(4).unwrap().as_str() {
-            "your average last frost date" => TimingType::LastFrost,
-            "transplanting" => TimingType::Transplant,
-            _ => return None,
+
+        let relative_timing = match cap.get(3).unwrap().as_str() {
+            "before" => RelativeTiming::Before,
+            "after" => RelativeTiming::After,
+            _ => unreachable!(),
         };
+
         Some(SowingTime {
             weeks_min: cap.get(1).unwrap().as_str().parse().unwrap(),
             weeks_max: cap.get(2).unwrap().as_str().parse().unwrap(),
-            relative_timing: RelativeTiming::After,
+            relative_timing,
             timing_type,
         })
-    } else {
-        None
-    }
+    })
 }
 
 fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
@@ -350,8 +338,6 @@ fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
     match (outside, inside) {
         (Some(out), _) if out.contains("RECOMMENDED") => Some("Outside"),
         (_, Some(ins)) if ins.contains("RECOMMENDED") => Some("Inside"),
-        (Some(_), _) => Some("Outside"), // Default to outside if no recommendation
-        (_, Some(_)) => Some("Inside"),
         _ => None,
     }
 }
