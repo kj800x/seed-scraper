@@ -283,13 +283,13 @@ fn process_csv(file_path: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TimingType {
     LastFrost,
     Transplant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SowingTime {
     weeks_min: i64,
     weeks_max: i64,
@@ -297,7 +297,7 @@ struct SowingTime {
     timing_type: TimingType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RelativeTiming {
     Before,
     After,
@@ -356,49 +356,26 @@ fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
     }
 }
 
-fn get_when_to_seed_start(info: &PlantInfo) -> Option<String> {
+fn get_when_to_seed_start(info: &PlantInfo) -> Option<SowingTime> {
     let strategy = determine_sowing_strategy(info);
     let text = match strategy {
         Some("Inside") => info.when_to_start_inside.as_deref(),
         _ => info.when_to_sow_outside.as_deref(), // Default to outside instructions
     };
 
-    text.and_then(extract_weeks_pattern).map(|sowing_time| {
-        let relative = match sowing_time.relative_timing {
-            RelativeTiming::Before => "before",
-            RelativeTiming::After => "after",
-        };
-        let timing = match sowing_time.timing_type {
-            TimingType::LastFrost => "LAST_FROST",
-            TimingType::Transplant => "TRANSPLANT",
-        };
-        format!(
-            "{}-{} {} {}",
-            sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
-        )
-    })
+    text.and_then(extract_weeks_pattern)
 }
 
-fn calculate_start_date(timing: &str, frost_date: NaiveDate) -> Option<NaiveDate> {
-    let re = regex::Regex::new(r"(\d+)-(\d+)\s+(before|after)\s+(LAST_FROST|TRANSPLANT)").unwrap();
+fn calculate_start_date(sowing_time: &SowingTime, frost_date: NaiveDate) -> NaiveDate {
+    let base_date = match sowing_time.timing_type {
+        TimingType::LastFrost => frost_date,
+        TimingType::Transplant => frost_date + Days::new(21), // 3 weeks after frost date
+    };
 
-    re.captures(timing).map(|cap| {
-        let weeks = cap.get(1).unwrap().as_str().parse::<i64>().unwrap();
-        let relative = cap.get(3).unwrap().as_str();
-        let timing_type = cap.get(4).unwrap().as_str();
-
-        let base_date = match timing_type {
-            "LAST_FROST" => frost_date,
-            "TRANSPLANT" => frost_date + Days::new(21), // 3 weeks after frost date
-            _ => frost_date,
-        };
-
-        match relative {
-            "before" => base_date - Days::new((weeks * 7) as u64),
-            "after" => base_date + Days::new((weeks * 7) as u64),
-            _ => base_date,
-        }
-    })
+    match sowing_time.relative_timing {
+        RelativeTiming::Before => base_date - Days::new((sowing_time.weeks_min * 7) as u64),
+        RelativeTiming::After => base_date + Days::new((sowing_time.weeks_min * 7) as u64),
+    }
 }
 
 fn export_to_csv(dir: &str) -> Result<()> {
@@ -459,9 +436,26 @@ fn export_to_csv(dir: &str) -> Result<()> {
 
             let when_to_start = get_when_to_seed_start(&info);
 
+            let when_to_start_str = when_to_start
+                .as_ref()
+                .map(|sowing_time| {
+                    let relative = match sowing_time.relative_timing {
+                        RelativeTiming::Before => "before",
+                        RelativeTiming::After => "after",
+                    };
+                    let timing = match sowing_time.timing_type {
+                        TimingType::LastFrost => "LAST_FROST",
+                        TimingType::Transplant => "TRANSPLANT",
+                    };
+                    format!(
+                        "{}-{} {} {}",
+                        sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
+                    )
+                })
+                .unwrap_or_else(|| "NULL".to_string());
+
             let start_date = when_to_start
-                .clone()
-                .and_then(|t| calculate_start_date(&t, frost_date))
+                .map(|t| calculate_start_date(&t, frost_date))
                 .map(|d| d.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "NULL".to_string());
 
@@ -491,7 +485,7 @@ fn export_to_csv(dir: &str) -> Result<()> {
                 info.rating.map_or("NULL".to_string(), |r| r.to_string()),
                 info.votes.map_or("NULL".to_string(), |v| v.to_string()),
                 sowing_strategy,
-                when_to_start.unwrap_or_else(|| "NULL".to_string()),
+                when_to_start_str,
                 start_date,
             ])?;
         }
@@ -705,24 +699,44 @@ mod tests {
         let frost_date = NaiveDate::from_ymd_opt(2025, 5, 10).unwrap();
 
         // Test before last frost
-        let timing = "2-4 before LAST_FROST";
-        let result = calculate_start_date(timing, frost_date).unwrap();
+        let sowing_time = SowingTime {
+            weeks_min: 2,
+            weeks_max: 4,
+            relative_timing: RelativeTiming::Before,
+            timing_type: TimingType::LastFrost,
+        };
+        let result = calculate_start_date(&sowing_time, frost_date);
         assert_eq!(result, NaiveDate::from_ymd_opt(2025, 4, 26).unwrap()); // 2 weeks before May 10
 
         // Test after last frost
-        let timing = "1-2 after LAST_FROST";
-        let result = calculate_start_date(timing, frost_date).unwrap();
+        let sowing_time = SowingTime {
+            weeks_min: 1,
+            weeks_max: 2,
+            relative_timing: RelativeTiming::After,
+            timing_type: TimingType::LastFrost,
+        };
+        let result = calculate_start_date(&sowing_time, frost_date);
         assert_eq!(result, NaiveDate::from_ymd_opt(2025, 5, 17).unwrap()); // 1 week after May 10
 
         // Test before transplant
-        let timing = "6-8 before TRANSPLANT";
-        let result = calculate_start_date(timing, frost_date).unwrap();
+        let sowing_time = SowingTime {
+            weeks_min: 6,
+            weeks_max: 8,
+            relative_timing: RelativeTiming::Before,
+            timing_type: TimingType::Transplant,
+        };
+        let result = calculate_start_date(&sowing_time, frost_date);
         let transplant_date = frost_date + Days::new(21); // 3 weeks after frost date
         assert_eq!(result, transplant_date - Days::new(42)); // 6 weeks before transplant
 
         // Test after transplant
-        let timing = "1-2 after TRANSPLANT";
-        let result = calculate_start_date(timing, frost_date).unwrap();
+        let sowing_time = SowingTime {
+            weeks_min: 1,
+            weeks_max: 2,
+            relative_timing: RelativeTiming::After,
+            timing_type: TimingType::Transplant,
+        };
+        let result = calculate_start_date(&sowing_time, frost_date);
         let transplant_date = frost_date + Days::new(21); // 3 weeks after frost date
         assert_eq!(result, transplant_date + Days::new(7)); // 1 week after transplant
     }
@@ -757,19 +771,28 @@ mod tests {
 
         // Test outside sowing before frost
         let result = get_when_to_seed_start(&info).unwrap();
-        assert_eq!(result, "2-4 before LAST_FROST");
+        assert_eq!(result.weeks_min, 2);
+        assert_eq!(result.weeks_max, 4);
+        assert!(matches!(result.relative_timing, RelativeTiming::Before));
+        assert!(matches!(result.timing_type, TimingType::LastFrost));
 
         // Test outside sowing after frost
         info.when_to_sow_outside =
             Some("1 to 2 weeks after your average last frost date".to_string());
         let result = get_when_to_seed_start(&info).unwrap();
-        assert_eq!(result, "1-2 after LAST_FROST");
+        assert_eq!(result.weeks_min, 1);
+        assert_eq!(result.weeks_max, 2);
+        assert!(matches!(result.relative_timing, RelativeTiming::After));
+        assert!(matches!(result.timing_type, TimingType::LastFrost));
 
         // Test inside sowing before transplant
         info.when_to_start_inside =
             Some("RECOMMENDED. 6 to 8 weeks before transplanting".to_string());
         let result = get_when_to_seed_start(&info).unwrap();
-        assert_eq!(result, "6-8 before TRANSPLANT");
+        assert_eq!(result.weeks_min, 6);
+        assert_eq!(result.weeks_max, 8);
+        assert!(matches!(result.relative_timing, RelativeTiming::Before));
+        assert!(matches!(result.timing_type, TimingType::Transplant));
 
         // Test no pattern found
         info.when_to_sow_outside = Some("Direct sow in spring".to_string());
