@@ -345,8 +345,8 @@ fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
 fn get_when_to_seed_start(info: &PlantInfo) -> Option<SowingTime> {
     let strategy = determine_sowing_strategy(info);
     let text = match strategy {
-        Some("Inside") => info.when_to_start_inside.as_deref(),
-        _ => info.when_to_sow_outside.as_deref(), // Default to outside instructions
+        Some("Outside") => info.when_to_sow_outside.as_deref(),
+        _ => info.when_to_start_inside.as_deref(), // Default to inside instructions
     };
 
     text.and_then(extract_weeks_pattern)
