@@ -208,113 +208,37 @@ impl PlantInfo {
     }
 }
 
-fn process_csv(file_path: &str, json_dir: &str) -> Result<()> {
-    let results_dir = Path::new(json_dir);
-    if !results_dir.exists() {
-        fs::create_dir(results_dir).context(format!("Failed to create directory: {}", json_dir))?;
-    }
-
-    let mut failed_plants = Vec::new();
-    let mut rdr = csv::Reader::from_path(file_path)
-        .context(format!("Failed to read CSV file: {}", file_path))?;
-
-    for result in rdr.records() {
-        let record = match result {
-            Ok(record) => record,
-            Err(e) => {
-                eprintln!("Error reading CSV record: {}", e);
-                continue;
-            }
-        };
-
-        let plant = record.get(0).unwrap_or("unknown");
-        let url = match record.get(1) {
-            Some(url) if !url.trim().is_empty() => url,
-            Some(_) => {
-                eprintln!("Empty URL for plant: {}", plant);
-                failed_plants.push(plant.to_string());
-                continue;
-            }
-            None => {
-                eprintln!("Missing URL for plant: {}", plant);
-                failed_plants.push(plant.to_string());
-                continue;
-            }
-        };
-
-        let file_name = format!("{}/{}.json", json_dir, plant.replace("/", "_"));
-
-        // Skip if file already exists
-        if Path::new(&file_name).exists() {
-            println!("Skipping {} - result file already exists", plant);
-            continue;
-        }
-
-        println!("Processing {} from {}", plant, url);
-
-        // Sleep between requests
-        thread::sleep(StdDuration::from_secs(2));
-
-        let client = reqwest::blocking::Client::new();
-        let response = match client
-            .get(url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .header("Connection", "keep-alive")
-            .send()
-            .and_then(|r| r.text()) {
-                Ok(text) => text,
-                Err(e) => {
-                    eprintln!("Failed to fetch {}: {}", plant, e);
-                    failed_plants.push(plant.to_string());
-                    continue;
-                }
-            };
-
-        match PlantInfo::from_html(&response, url.to_string()) {
-            Ok(info) => {
-                let json = match serde_json::to_string_pretty(&info) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        eprintln!("Failed to serialize JSON for {}: {}", plant, e);
-                        failed_plants.push(plant.to_string());
-                        continue;
-                    }
-                };
-
-                if let Err(e) = fs::write(&file_name, json) {
-                    eprintln!("Failed to write file for {}: {}", plant, e);
-                    failed_plants.push(plant.to_string());
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to parse HTML for {}: {}", plant, e);
-                failed_plants.push(plant.to_string());
-            }
-        }
-    }
-
-    if !failed_plants.is_empty() {
-        eprintln!("\nFailed to process the following plants:");
-        for plant in &failed_plants {
-            eprintln!("- {}", plant);
-        }
-    } else {
-        println!("All plants processed successfully.");
-    }
-
-    println!("JSON results saved to directory: {}", json_dir);
-    Ok(())
+// Create a reusable HTTP client with standard headers
+fn create_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8".parse().unwrap(),
+            );
+            headers.insert(
+                reqwest::header::ACCEPT_LANGUAGE,
+                "en-US,en;q=0.5".parse().unwrap(),
+            );
+            headers.insert(
+                reqwest::header::CONNECTION,
+                "keep-alive".parse().unwrap(),
+            );
+            headers
+        })
+        .build()
+        .expect("Failed to create HTTP client")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum TimingType {
     LastFrost,
     Transplant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct SowingTime {
     weeks_min: i64,
     weeks_max: i64,
@@ -322,13 +246,13 @@ struct SowingTime {
     timing_type: TimingType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum RelativeTiming {
     Before,
     After,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum SowingStrategy {
     Inside,
     Outside,
@@ -421,6 +345,295 @@ fn calculate_start_date(sowing_time: &SowingTime, frost_date: NaiveDate) -> Naiv
     }
 }
 
+// Helper function to get field with NULL fallback
+fn get_field<T: AsRef<str>>(option: &Option<T>) -> &str {
+    option.as_ref().map(|s| s.as_ref()).unwrap_or("NULL")
+}
+
+// Helper function to create error records for plants with missing JSON
+fn create_error_record<'a>(input: &'a InputRecord) -> Vec<&'a str> {
+    let mut row = vec![
+        input.plant_name,
+        input.url,
+        input.brand,
+        input.purchase_year,
+        input.notes,
+        input.user_strategy_str,
+    ];
+    row.extend(vec!["ERR"; 24]); // 24 columns of scraped data
+    row
+}
+
+// Struct to represent an input CSV record
+struct InputRecord<'a> {
+    plant_name: &'a str,
+    url: &'a str,
+    brand: &'a str,
+    purchase_year: &'a str,
+    notes: &'a str,
+    user_strategy_str: &'a str,
+    user_strategy: Option<SowingStrategy>,
+}
+
+impl<'a> InputRecord<'a> {
+    // Create a new InputRecord from a CSV record
+    fn from_csv_record(record: &'a csv::StringRecord) -> Self {
+        let plant_name = record.get(0).unwrap_or("unknown");
+        let url = record.get(1).unwrap_or("");
+        let brand = record.get(2).unwrap_or("");
+        let purchase_year = record.get(3).unwrap_or("");
+        let notes = record.get(4).unwrap_or("");
+        let user_strategy_str = record.get(5).unwrap_or("");
+
+        // Parse the user strategy string
+        let user_strategy = match user_strategy_str {
+            "Inside" => Some(SowingStrategy::Inside),
+            "Outside" => Some(SowingStrategy::Outside),
+            _ if user_strategy_str.trim().is_empty() => None,
+            _ => None,
+        };
+
+        InputRecord {
+            plant_name,
+            url,
+            brand,
+            purchase_year,
+            notes,
+            user_strategy_str,
+            user_strategy,
+        }
+    }
+
+    // Check if this plant has JSON data
+    fn has_json_data(&self, json_dir: &str) -> bool {
+        let json_path = format!("{}/{}.json", json_dir, self.plant_name.replace("/", "_"));
+        Path::new(&json_path).exists()
+    }
+
+    // Get the path to the JSON file for this plant
+    fn json_path(&self, json_dir: &str) -> String {
+        format!("{}/{}.json", json_dir, self.plant_name.replace("/", "_"))
+    }
+
+    // Validate URL is not empty for scraping
+    fn has_valid_url(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+}
+
+// Struct to represent a complete output CSV record
+struct OutputRecord<'a> {
+    // Input CSV fields
+    plant_name: &'a str,
+    url: &'a str,
+    brand: &'a str,
+    purchase_year: &'a str,
+    notes: &'a str,
+    user_strategy: &'a str,
+
+    // Plant info fields
+    title: &'a str,
+    description: &'a str,
+    days_to_maturity: &'a str,
+    family: &'a str,
+    plant_type: &'a str,
+    native: &'a str,
+    hardiness: &'a str,
+    exposure: &'a str,
+    plant_dimensions: &'a str,
+    variety_info: &'a str,
+    attributes: &'a str,
+    when_to_sow_outside: &'a str,
+    when_to_start_inside: &'a str,
+    days_to_emerge: &'a str,
+    seed_depth: &'a str,
+    seed_spacing: &'a str,
+    row_spacing: &'a str,
+    thinning: &'a str,
+
+    // Owned fields that need to be String
+    rating: String,
+    votes: String,
+    sowing_strategy: String,
+    when_to_seed_start: String,
+    calculated_start_date: String,
+}
+
+impl<'a> OutputRecord<'a> {
+    // Create a new OutputRecord with all fields
+    fn new(
+        input: &'a InputRecord<'a>,
+        info: &'a PlantInfo,
+        sowing_strategy: Option<SowingStrategy>,
+        when_to_start_str: String,
+        start_date: String,
+    ) -> Self {
+        OutputRecord {
+            // Input CSV fields
+            plant_name: input.plant_name,
+            url: input.url,
+            brand: input.brand,
+            purchase_year: input.purchase_year,
+            notes: input.notes,
+            user_strategy: input.user_strategy_str,
+
+            // Plant info fields
+            title: get_field(&info.title),
+            description: get_field(&info.description),
+            days_to_maturity: get_field(&info.days_to_maturity),
+            family: get_field(&info.family),
+            plant_type: get_field(&info.plant_type),
+            native: get_field(&info.native),
+            hardiness: get_field(&info.hardiness),
+            exposure: get_field(&info.exposure),
+            plant_dimensions: get_field(&info.plant_dimensions),
+            variety_info: get_field(&info.variety_info),
+            attributes: get_field(&info.attributes),
+            when_to_sow_outside: get_field(&info.when_to_sow_outside),
+            when_to_start_inside: get_field(&info.when_to_start_inside),
+            days_to_emerge: get_field(&info.days_to_emerge),
+            seed_depth: get_field(&info.seed_depth),
+            seed_spacing: get_field(&info.seed_spacing),
+            row_spacing: get_field(&info.row_spacing),
+            thinning: get_field(&info.thinning),
+
+            // Owned fields
+            rating: info
+                .rating
+                .map_or_else(|| "NULL".to_string(), |r| r.to_string()),
+            votes: info
+                .votes
+                .map_or_else(|| "NULL".to_string(), |v| v.to_string()),
+            sowing_strategy: sowing_strategy
+                .as_ref()
+                .map_or_else(|| "NULL".to_string(), |s| s.to_string()),
+            when_to_seed_start: when_to_start_str,
+            calculated_start_date: start_date,
+        }
+    }
+
+    // Convert to a CSV record
+    fn to_record(&self) -> Vec<String> {
+        vec![
+            self.plant_name.to_string(),
+            self.url.to_string(),
+            self.brand.to_string(),
+            self.purchase_year.to_string(),
+            self.notes.to_string(),
+            self.user_strategy.to_string(),
+            self.title.to_string(),
+            self.description.to_string(),
+            self.days_to_maturity.to_string(),
+            self.family.to_string(),
+            self.plant_type.to_string(),
+            self.native.to_string(),
+            self.hardiness.to_string(),
+            self.exposure.to_string(),
+            self.plant_dimensions.to_string(),
+            self.variety_info.to_string(),
+            self.attributes.to_string(),
+            self.when_to_sow_outside.to_string(),
+            self.when_to_start_inside.to_string(),
+            self.days_to_emerge.to_string(),
+            self.seed_depth.to_string(),
+            self.seed_spacing.to_string(),
+            self.row_spacing.to_string(),
+            self.thinning.to_string(),
+            self.rating.clone(),
+            self.votes.clone(),
+            self.sowing_strategy.clone(),
+            self.when_to_seed_start.clone(),
+            self.calculated_start_date.clone(),
+        ]
+    }
+}
+
+fn process_csv(file_path: &str, json_dir: &str) -> Result<()> {
+    let results_dir = Path::new(json_dir);
+    if !results_dir.exists() {
+        fs::create_dir(results_dir).context(format!("Failed to create directory: {}", json_dir))?;
+    }
+
+    let mut failed_plants = Vec::new();
+    let mut rdr = csv::Reader::from_path(file_path)
+        .context(format!("Failed to read CSV file: {}", file_path))?;
+
+    for result in rdr.records() {
+        let record = match result {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("Error reading CSV record: {}", e);
+                continue;
+            }
+        };
+
+        // Parse the input record
+        let input = InputRecord::from_csv_record(&record);
+
+        // Validate URL for scraping
+        if !input.has_valid_url() {
+            eprintln!("Empty URL for plant: {}", input.plant_name);
+            failed_plants.push(input.plant_name.to_string());
+            continue;
+        }
+
+        // Skip if file already exists
+        if input.has_json_data(json_dir) {
+            println!("Skipping {} - result file already exists", input.plant_name);
+            continue;
+        }
+
+        println!("Processing {} from {}", input.plant_name, input.url);
+
+        // Sleep between requests
+        thread::sleep(StdDuration::from_secs(2));
+
+        let client = create_http_client();
+        let response = match client.get(input.url).send().and_then(|r| r.text()) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("Failed to fetch {}: {}", input.plant_name, e);
+                failed_plants.push(input.plant_name.to_string());
+                continue;
+            }
+        };
+
+        match PlantInfo::from_html(&response, input.url.to_string()) {
+            Ok(info) => {
+                let json = match serde_json::to_string_pretty(&info) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize JSON for {}: {}", input.plant_name, e);
+                        failed_plants.push(input.plant_name.to_string());
+                        continue;
+                    }
+                };
+
+                if let Err(e) = fs::write(&input.json_path(json_dir), json) {
+                    eprintln!("Failed to write file for {}: {}", input.plant_name, e);
+                    failed_plants.push(input.plant_name.to_string());
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to parse HTML for {}: {}", input.plant_name, e);
+                failed_plants.push(input.plant_name.to_string());
+            }
+        }
+    }
+
+    if !failed_plants.is_empty() {
+        eprintln!("\nFailed to process the following plants:");
+        for plant in &failed_plants {
+            eprintln!("- {}", plant);
+        }
+    } else {
+        println!("All plants processed successfully.");
+    }
+
+    println!("JSON results saved to directory: {}", json_dir);
+    Ok(())
+}
+
 fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<()> {
     let results_dir = Path::new(json_dir);
     if !results_dir.exists() {
@@ -480,52 +693,27 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             }
         };
 
-        // Get values from the input CSV
-        let plant = record.get(0).unwrap_or("unknown");
+        // Parse the input record
+        let input = InputRecord::from_csv_record(&record);
 
-        // We don't need to reject empty URLs in the export process,
-        // just read what's there (even if it's empty)
-        let url = record.get(1).unwrap_or("");
-
-        let brand = record.get(2).unwrap_or("");
-        let purchase_year = record.get(3).unwrap_or("");
-        let notes = record.get(4).unwrap_or("");
-
-        // Convert user strategy string to SowingStrategy enum
-        let user_strategy_str = record.get(5);
-        let user_strategy = user_strategy_str.and_then(|s| match s {
-            "Inside" => Some(SowingStrategy::Inside),
-            "Outside" => Some(SowingStrategy::Outside),
-            _ if s.trim().is_empty() => None,
-            _ => None,
-        });
-
-        // Load the JSON file for this plant
-        let json_path = format!("{}/{}.json", json_dir, plant.replace("/", "_"));
-
-        if !Path::new(&json_path).exists() {
-            eprintln!("Warning: No JSON data found for plant: {}", plant);
-            // Write a row with just the input data and ERR for everything else
-            let errors: Vec<&str> = vec!["ERR"; 24]; // 24 columns of scraped data
-            let mut row = vec![
-                plant,
-                url,
-                brand,
-                purchase_year,
-                notes,
-                user_strategy_str.unwrap_or(""),
-            ];
-            row.extend(errors);
+        // Check if JSON data exists for this plant
+        if !input.has_json_data(json_dir) {
+            eprintln!(
+                "Warning: No JSON data found for plant: {}",
+                input.plant_name
+            );
+            // Use the helper function to create the error record
+            let row = create_error_record(&input);
             writer.write_record(&row)?;
             missing_json_count += 1;
             continue;
         }
 
         // Read and parse the JSON file
-        let content = match fs::read_to_string(&json_path) {
+        let content = match fs::read_to_string(&input.json_path(json_dir)) {
             Ok(content) => content,
             Err(e) => {
-                eprintln!("Failed to read JSON file for {}: {}", plant, e);
+                eprintln!("Failed to read JSON file for {}: {}", input.plant_name, e);
                 continue;
             }
         };
@@ -533,16 +721,16 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
         let info: PlantInfo = match serde_json::from_str(&content) {
             Ok(info) => info,
             Err(e) => {
-                eprintln!("Failed to parse JSON for {}: {}", plant, e);
+                eprintln!("Failed to parse JSON for {}: {}", input.plant_name, e);
                 continue;
             }
         };
 
         // Get the sowing strategy as an enum
-        let sowing_strategy = determine_sowing_strategy(&info, user_strategy.clone());
+        let sowing_strategy = determine_sowing_strategy(&info, input.user_strategy);
 
         // Get the sowing time based on the strategy enum
-        let when_to_start = get_when_to_seed_start(&info, user_strategy);
+        let when_to_start = get_when_to_seed_start(&info, input.user_strategy);
 
         let when_to_start_str = when_to_start
             .as_ref()
@@ -567,65 +755,19 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "NULL".to_string());
 
-        let title = info.title.as_deref().unwrap_or("NULL");
-        let description = info.description.as_deref().unwrap_or("NULL");
-        let days_to_maturity = info.days_to_maturity.as_deref().unwrap_or("NULL");
-        let family = info.family.as_deref().unwrap_or("NULL");
-        let plant_type = info.plant_type.as_deref().unwrap_or("NULL");
-        let native = info.native.as_deref().unwrap_or("NULL");
-        let hardiness = info.hardiness.as_deref().unwrap_or("NULL");
-        let exposure = info.exposure.as_deref().unwrap_or("NULL");
-        let plant_dimensions = info.plant_dimensions.as_deref().unwrap_or("NULL");
-        let variety_info = info.variety_info.as_deref().unwrap_or("NULL");
-        let attributes = info.attributes.as_deref().unwrap_or("NULL");
-        let when_to_sow_outside = info.when_to_sow_outside.as_deref().unwrap_or("NULL");
-        let when_to_start_inside = info.when_to_start_inside.as_deref().unwrap_or("NULL");
-        let days_to_emerge = info.days_to_emerge.as_deref().unwrap_or("NULL");
-        let seed_depth = info.seed_depth.as_deref().unwrap_or("NULL");
-        let seed_spacing = info.seed_spacing.as_deref().unwrap_or("NULL");
-        let row_spacing = info.row_spacing.as_deref().unwrap_or("NULL");
-        let thinning = info.thinning.as_deref().unwrap_or("NULL");
+        // Create an OutputRecord and write it to the CSV
+        let record = OutputRecord::new(
+            &input,
+            &info,
+            sowing_strategy,
+            when_to_start_str,
+            start_date,
+        );
 
-        // Create owned strings for these values to avoid referencing temporary values
-        let rating_str = info.rating.map_or("NULL".to_string(), |r| r.to_string());
-        let votes_str = info.votes.map_or("NULL".to_string(), |v| v.to_string());
-        let rating = rating_str.as_str();
-        let votes = votes_str.as_str();
-
-        writer.write_record(&[
-            plant,
-            url,
-            brand,
-            purchase_year,
-            notes,
-            user_strategy_str.unwrap_or(""),
-            title,
-            description,
-            days_to_maturity,
-            family,
-            plant_type,
-            native,
-            hardiness,
-            exposure,
-            plant_dimensions,
-            variety_info,
-            attributes,
-            when_to_sow_outside,
-            when_to_start_inside,
-            days_to_emerge,
-            seed_depth,
-            seed_spacing,
-            row_spacing,
-            thinning,
-            rating,
-            votes,
-            &sowing_strategy
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            &when_to_start_str,
-            &start_date,
-        ])?;
+        // Convert the record to strings and write them to the CSV
+        let string_record = record.to_record();
+        let str_refs: Vec<&str> = string_record.iter().map(|s| s.as_str()).collect();
+        writer.write_record(&str_refs)?;
         processed_count += 1;
     }
 
@@ -646,14 +788,9 @@ fn main() -> Result<()> {
 
     match args.command {
         Commands::Single { url, output } => {
-            // Existing single URL processing code
-            let client = reqwest::blocking::Client::new();
+            let client = create_http_client();
             let response = client
                 .get(&url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                .header("Accept-Language", "en-US,en;q=0.5")
-                .header("Connection", "keep-alive")
                 .send()
                 .context("Failed to send request")?
                 .text()
@@ -982,5 +1119,155 @@ mod tests {
         // Test with user strategy overriding
         let result = determine_sowing_strategy(&info, Some(SowingStrategy::Outside));
         assert_eq!(result, Some(SowingStrategy::Outside));
+    }
+
+    #[test]
+    fn test_input_record_from_csv() {
+        // Create a mock CSV record
+        let record = csv::StringRecord::from(vec![
+            "Carrot",
+            "http://example.com",
+            "Brand X",
+            "2023",
+            "Test notes",
+            "Inside",
+        ]);
+
+        let input = InputRecord::from_csv_record(&record);
+
+        assert_eq!(input.plant_name, "Carrot");
+        assert_eq!(input.url, "http://example.com");
+        assert_eq!(input.brand, "Brand X");
+        assert_eq!(input.purchase_year, "2023");
+        assert_eq!(input.notes, "Test notes");
+        assert_eq!(input.user_strategy_str, "Inside");
+        assert_eq!(input.user_strategy, Some(SowingStrategy::Inside));
+    }
+
+    #[test]
+    fn test_input_record_with_empty_strategy() {
+        // Create a mock CSV record with empty strategy
+        let record = csv::StringRecord::from(vec![
+            "Carrot",
+            "http://example.com",
+            "Brand X",
+            "2023",
+            "Test notes",
+            "",
+        ]);
+
+        let input = InputRecord::from_csv_record(&record);
+
+        assert_eq!(input.user_strategy_str, "");
+        assert_eq!(input.user_strategy, None);
+    }
+
+    #[test]
+    fn test_create_error_record() {
+        // Create a mock input record
+        let record = csv::StringRecord::from(vec![
+            "Carrot",
+            "http://example.com",
+            "Brand X",
+            "2023",
+            "Test notes",
+            "Inside",
+        ]);
+
+        let input = InputRecord::from_csv_record(&record);
+
+        // Create error record
+        let error_record = create_error_record(&input);
+
+        // Check the first 6 fields come from input
+        assert_eq!(error_record[0], "Carrot");
+        assert_eq!(error_record[1], "http://example.com");
+        assert_eq!(error_record[2], "Brand X");
+        assert_eq!(error_record[3], "2023");
+        assert_eq!(error_record[4], "Test notes");
+        assert_eq!(error_record[5], "Inside");
+
+        // Check that we have 24 ERR fields
+        assert_eq!(error_record.len(), 30); // 6 input fields + 24 ERR fields
+        assert_eq!(error_record[6], "ERR");
+        assert_eq!(error_record[29], "ERR");
+    }
+
+    #[test]
+    fn test_output_record_creation() {
+        // Create a mock input record
+        let record = csv::StringRecord::from(vec![
+            "Carrot",
+            "http://example.com",
+            "Brand X",
+            "2023",
+            "Test notes",
+            "Inside",
+        ]);
+
+        let input = InputRecord::from_csv_record(&record);
+
+        // Create a mock PlantInfo
+        let info = PlantInfo {
+            url: "http://example.com".to_string(),
+            title: Some("Test Carrot".to_string()),
+            description: Some("A test carrot description".to_string()),
+            days_to_maturity: Some("70 days".to_string()),
+            family: Some("Apiaceae".to_string()),
+            plant_type: None,
+            native: None,
+            hardiness: None,
+            exposure: None,
+            plant_dimensions: None,
+            variety_info: None,
+            attributes: None,
+            when_to_sow_outside: Some(
+                "2 to 4 weeks before your average last frost date".to_string(),
+            ),
+            when_to_start_inside: None,
+            days_to_emerge: None,
+            seed_depth: None,
+            seed_spacing: None,
+            row_spacing: None,
+            thinning: None,
+            rating: Some(4.5),
+            votes: Some(10),
+        };
+
+        // Create OutputRecord
+        let output = OutputRecord::new(
+            &input,
+            &info,
+            Some(SowingStrategy::Inside),
+            "6-8 before TRANSPLANT".to_string(),
+            "2025-03-15".to_string(),
+        );
+
+        // Verify input fields are copied correctly
+        assert_eq!(output.plant_name, "Carrot");
+        assert_eq!(output.url, "http://example.com");
+        assert_eq!(output.brand, "Brand X");
+        assert_eq!(output.purchase_year, "2023");
+        assert_eq!(output.notes, "Test notes");
+        assert_eq!(output.user_strategy, "Inside");
+
+        // Verify plant info fields
+        assert_eq!(output.title, "Test Carrot");
+        assert_eq!(output.description, "A test carrot description");
+        assert_eq!(output.days_to_maturity, "70 days");
+        assert_eq!(output.family, "Apiaceae");
+
+        // Verify calculated fields
+        assert_eq!(output.rating, "4.5");
+        assert_eq!(output.votes, "10");
+        assert_eq!(output.sowing_strategy, "Inside");
+        assert_eq!(output.when_to_seed_start, "6-8 before TRANSPLANT");
+        assert_eq!(output.calculated_start_date, "2025-03-15");
+
+        // Verify converted to record
+        let record_vec = output.to_record();
+        assert_eq!(record_vec[0], "Carrot");
+        assert_eq!(record_vec[6], "Test Carrot");
+        assert_eq!(record_vec[26], "Inside");
     }
 }
