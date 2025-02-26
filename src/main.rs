@@ -7,6 +7,11 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path, thread, time::Duration as StdDuration};
 
+// Constants for CSV field management
+const CSV_FIELD_COUNT: usize = 29; // Total number of fields in a CSV record
+const INPUT_FIELD_COUNT: usize = 6; // Number of fields from input CSV
+const ERR_FIELD_COUNT: usize = CSV_FIELD_COUNT - INPUT_FIELD_COUNT; // Fields to fill with "ERR"
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -360,7 +365,7 @@ fn create_error_record<'a>(input: &'a InputRecord) -> Vec<&'a str> {
         input.notes,
         input.user_strategy_str,
     ];
-    row.extend(vec!["ERR"; 24]); // 24 columns of scraped data
+    row.extend(vec!["ERR"; ERR_FIELD_COUNT]); // Use constant for error field count
     row
 }
 
@@ -514,7 +519,7 @@ impl<'a> OutputRecord<'a> {
 
     // Convert to a CSV record
     fn to_record(&self) -> Vec<String> {
-        vec![
+        let record = vec![
             self.plant_name.to_string(),
             self.url.to_string(),
             self.brand.to_string(),
@@ -544,7 +549,16 @@ impl<'a> OutputRecord<'a> {
             self.sowing_strategy.clone(),
             self.when_to_seed_start.clone(),
             self.calculated_start_date.clone(),
-        ]
+        ];
+
+        // Validate record length matches expected field count
+        debug_assert_eq!(
+            record.len(),
+            CSV_FIELD_COUNT,
+            "OutputRecord::to_record produced incorrect number of fields"
+        );
+
+        record
     }
 }
 
@@ -732,36 +746,36 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
         // Get the sowing time based on the strategy enum
         let when_to_start = get_when_to_seed_start(&info, input.user_strategy);
 
-        let when_to_start_str = when_to_start
-            .as_ref()
-            .map(|sowing_time| {
-                let relative = match sowing_time.relative_timing {
-                    RelativeTiming::Before => "before",
-                    RelativeTiming::After => "after",
-                };
-                let timing = match sowing_time.timing_type {
-                    TimingType::LastFrost => "LAST_FROST",
-                    TimingType::Transplant => "TRANSPLANT",
-                };
-                format!(
-                    "{}-{} {} {}",
-                    sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
-                )
-            })
-            .unwrap_or_else(|| "NULL".to_string());
+            let when_to_start_str = when_to_start
+                .as_ref()
+                .map(|sowing_time| {
+                    let relative = match sowing_time.relative_timing {
+                        RelativeTiming::Before => "before",
+                        RelativeTiming::After => "after",
+                    };
+                    let timing = match sowing_time.timing_type {
+                        TimingType::LastFrost => "LAST_FROST",
+                        TimingType::Transplant => "TRANSPLANT",
+                    };
+                    format!(
+                        "{}-{} {} {}",
+                        sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
+                    )
+                })
+                .unwrap_or_else(|| "NULL".to_string());
 
-        let start_date = when_to_start
-            .map(|t| calculate_start_date(&t, frost_date))
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "NULL".to_string());
+            let start_date = when_to_start
+                .map(|t| calculate_start_date(&t, frost_date))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "NULL".to_string());
 
         // Create an OutputRecord and write it to the CSV
         let record = OutputRecord::new(
             &input,
             &info,
-            sowing_strategy,
-            when_to_start_str,
-            start_date,
+                sowing_strategy,
+                when_to_start_str,
+                start_date,
         );
 
         // Convert the record to strings and write them to the CSV
@@ -1052,7 +1066,7 @@ mod tests {
             when_to_sow_outside: Some(
                 "2 to 4 weeks before your average last frost date".to_string(),
             ),
-            when_to_start_inside: None,
+            when_to_start_inside: Some("6 to 8 weeks before transplanting".to_string()),
             days_to_emerge: None,
             seed_depth: None,
             seed_spacing: None,
@@ -1062,14 +1076,14 @@ mod tests {
             votes: None,
         };
 
-        // Test with no user strategy
+        // Test with no user strategy - should use outside (default)
         let result = get_when_to_seed_start(&info, None).unwrap();
         assert_eq!(result.weeks_min, 2);
         assert_eq!(result.weeks_max, 4);
         assert!(matches!(result.relative_timing, RelativeTiming::Before));
         assert!(matches!(result.timing_type, TimingType::LastFrost));
 
-        // Add new test cases for user strategy
+        // Test with Inside strategy - should use inside timing
         let result = get_when_to_seed_start(&info, Some(SowingStrategy::Inside)).unwrap();
         assert_eq!(result.weeks_min, 6);
         assert_eq!(result.weeks_max, 8);
@@ -1187,10 +1201,10 @@ mod tests {
         assert_eq!(error_record[4], "Test notes");
         assert_eq!(error_record[5], "Inside");
 
-        // Check that we have 24 ERR fields
-        assert_eq!(error_record.len(), 30); // 6 input fields + 24 ERR fields
+        // Check that the total number of fields is correct
+        assert_eq!(error_record.len(), CSV_FIELD_COUNT);
         assert_eq!(error_record[6], "ERR");
-        assert_eq!(error_record[29], "ERR");
+        assert_eq!(error_record[CSV_FIELD_COUNT - 1], "ERR");
     }
 
     #[test]
