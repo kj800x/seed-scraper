@@ -20,16 +20,24 @@ enum Commands {
     Single {
         #[arg(short, long)]
         url: String,
+        #[arg(short, long)]
+        output: Option<String>,
     },
     /// Process a CSV file containing plant names and URLs
     Batch {
         #[arg(short, long)]
         file: String,
+        #[arg(short, long)]
+        json_dir: String,
     },
     /// Export data from JSON files to CSV, using input CSV for additional columns
     Export {
         #[arg(short, long)]
-        file: String,
+        input_file: String,
+        #[arg(short, long)]
+        output_file: String,
+        #[arg(short, long)]
+        json_dir: String,
     },
 }
 
@@ -200,14 +208,15 @@ impl PlantInfo {
     }
 }
 
-fn process_csv(file_path: &str) -> Result<()> {
-    let results_dir = Path::new("results");
+fn process_csv(file_path: &str, json_dir: &str) -> Result<()> {
+    let results_dir = Path::new(json_dir);
     if !results_dir.exists() {
-        fs::create_dir(results_dir).context("Failed to create results directory")?;
+        fs::create_dir(results_dir).context(format!("Failed to create directory: {}", json_dir))?;
     }
 
     let mut failed_plants = Vec::new();
-    let mut rdr = csv::Reader::from_path(file_path).context("Failed to read CSV file")?;
+    let mut rdr = csv::Reader::from_path(file_path)
+        .context(format!("Failed to read CSV file: {}", file_path))?;
 
     for result in rdr.records() {
         let record = match result {
@@ -228,7 +237,7 @@ fn process_csv(file_path: &str) -> Result<()> {
             }
         };
 
-        let file_name = format!("results/{}.json", plant.replace("/", "_"));
+        let file_name = format!("{}/{}.json", json_dir, plant.replace("/", "_"));
 
         // Skip if file already exists
         if Path::new(&file_name).exists() {
@@ -286,8 +295,11 @@ fn process_csv(file_path: &str) -> Result<()> {
         for plant in &failed_plants {
             eprintln!("- {}", plant);
         }
+    } else {
+        println!("All plants processed successfully.");
     }
 
+    println!("JSON results saved to directory: {}", json_dir);
     Ok(())
 }
 
@@ -376,17 +388,17 @@ fn calculate_start_date(sowing_time: &SowingTime, frost_date: NaiveDate) -> Naiv
     }
 }
 
-fn export_to_csv(file_path: &str) -> Result<()> {
-    let results_dir = Path::new("results");
+fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<()> {
+    let results_dir = Path::new(json_dir);
     if !results_dir.exists() {
-        return Err(anyhow::anyhow!("Results directory does not exist"));
+        return Err(anyhow::anyhow!("Directory {} does not exist", json_dir));
     }
 
     // Read the input CSV file
-    let mut input_rdr = csv::Reader::from_path(file_path)
-        .context(format!("Failed to read input CSV file: {}", file_path))?;
+    let mut input_rdr = csv::Reader::from_path(input_file)
+        .context(format!("Failed to read input CSV file: {}", input_file))?;
 
-    let mut writer = csv::Writer::from_path("export.csv")?;
+    let mut writer = csv::Writer::from_path(output_file)?;
 
     // Write headers - include the original columns plus the scraped data
     writer.write_record(&[
@@ -421,6 +433,8 @@ fn export_to_csv(file_path: &str) -> Result<()> {
     ])?;
 
     let frost_date = NaiveDate::from_ymd_opt(2025, 5, 10).unwrap();
+    let mut processed_count = 0;
+    let mut missing_json_count = 0;
 
     // Process each row in the input CSV
     for result in input_rdr.records() {
@@ -440,7 +454,7 @@ fn export_to_csv(file_path: &str) -> Result<()> {
         let notes = record.get(4).unwrap_or("");
 
         // Load the JSON file for this plant
-        let json_path = format!("results/{}.json", plant.replace("/", "_"));
+        let json_path = format!("{}/{}.json", json_dir, plant.replace("/", "_"));
 
         if !Path::new(&json_path).exists() {
             eprintln!("Warning: No JSON data found for plant: {}", plant);
@@ -449,6 +463,7 @@ fn export_to_csv(file_path: &str) -> Result<()> {
             let mut row = vec![plant, url, brand, purchase_year, notes];
             row.extend(nulls);
             writer.write_record(&row)?;
+            missing_json_count += 1;
             continue;
         }
 
@@ -553,10 +568,18 @@ fn export_to_csv(file_path: &str) -> Result<()> {
             &when_to_start_str,
             &start_date,
         ])?;
+        processed_count += 1;
     }
 
     writer.flush()?;
-    println!("Exported data to export.csv");
+    println!("Exported data to {}", output_file);
+    println!("Used JSON data from directory: {}", json_dir);
+    println!("Used input CSV file: {}", input_file);
+    println!(
+        "Processed {} plants ({} with missing JSON data)",
+        processed_count + missing_json_count,
+        missing_json_count
+    );
     Ok(())
 }
 
@@ -564,7 +587,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Single { url } => {
+        Commands::Single { url, output } => {
             // Existing single URL processing code
             let client = reqwest::blocking::Client::new();
             let response = client
@@ -580,7 +603,14 @@ fn main() -> Result<()> {
 
             match PlantInfo::from_html(&response, url) {
                 Ok(info) => {
-                    println!("{}", serde_json::to_string_pretty(&info)?);
+                    let json = serde_json::to_string_pretty(&info)?;
+                    println!("{}", json);
+
+                    if let Some(output_path) = output {
+                        fs::write(&output_path, &json)
+                            .context(format!("Failed to write output to {}", output_path))?;
+                        println!("Results saved to: {}", output_path);
+                    }
                 }
                 Err(ScrapingError::CloudflareBlocked) => {
                     eprintln!("Error: Access blocked by Cloudflare protection");
@@ -593,11 +623,15 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Batch { file } => {
-            process_csv(&file)?;
+        Commands::Batch { file, json_dir } => {
+            process_csv(&file, &json_dir)?;
         }
-        Commands::Export { file } => {
-            export_to_csv(&file)?;
+        Commands::Export {
+            input_file,
+            output_file,
+            json_dir,
+        } => {
+            export_to_csv(&input_file, &output_file, &json_dir)?;
         }
     }
 
