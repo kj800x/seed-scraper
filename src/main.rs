@@ -458,10 +458,10 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
 
         if !Path::new(&json_path).exists() {
             eprintln!("Warning: No JSON data found for plant: {}", plant);
-            // Write a row with just the input data and NULL for everything else
-            let nulls: Vec<&str> = vec!["NULL"; 24]; // 24 columns of scraped data
+            // Write a row with just the input data and ERR for everything else
+            let errors: Vec<&str> = vec!["ERR"; 24]; // 24 columns of scraped data
             let mut row = vec![plant, url, brand, purchase_year, notes];
-            row.extend(nulls);
+            row.extend(errors);
             writer.write_record(&row)?;
             missing_json_count += 1;
             continue;
@@ -576,7 +576,7 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
     println!("Used JSON data from directory: {}", json_dir);
     println!("Used input CSV file: {}", input_file);
     println!(
-        "Processed {} plants ({} with missing JSON data)",
+        "Processed {} plants ({} with missing JSON data marked as ERR)",
         processed_count + missing_json_count,
         missing_json_count
     );
