@@ -328,6 +328,22 @@ enum RelativeTiming {
     After,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum SowingStrategy {
+    Inside,
+    Outside,
+}
+
+// Add a method to convert SowingStrategy to string for display
+impl SowingStrategy {
+    fn to_string(&self) -> String {
+        match self {
+            SowingStrategy::Inside => "Inside".to_string(),
+            SowingStrategy::Outside => "Outside".to_string(),
+        }
+    }
+}
+
 fn extract_weeks_pattern(text: &str) -> Option<SowingTime> {
     let re = regex::Regex::new(
         r"(\d+)\s*to\s*(\d+)\s*weeks\s*(before|after)\s*(your average last frost date|transplanting)",
@@ -356,28 +372,40 @@ fn extract_weeks_pattern(text: &str) -> Option<SowingTime> {
     })
 }
 
-fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
-    let outside = info.when_to_sow_outside.as_deref();
-    let inside = info.when_to_start_inside.as_deref();
+fn determine_sowing_strategy(
+    info: &PlantInfo,
+    user_strategy: Option<SowingStrategy>,
+) -> Option<SowingStrategy> {
+    // If user provided a strategy, use it
+    if let Some(strategy) = user_strategy {
+        return Some(strategy);
+    }
 
-    match (outside, inside) {
-        (Some(out), _) if out.contains("RECOMMENDED") => Some("Outside"),
-        (_, Some(ins)) if ins.contains("RECOMMENDED") => Some("Inside"),
-        (Some(_), None) => Some("Outside"), // Default to outside if no inside instructions
-        (None, Some(_)) => Some("Inside"),  // Default to inside if no outside instructions
-        (Some(_), Some(_)) => Some("Outside"), // Default to outside if both are available but no recommendation
+    // Otherwise use the derived strategy
+    match (
+        info.when_to_sow_outside.as_deref(),
+        info.when_to_start_inside.as_deref(),
+    ) {
+        (Some(out), _) if out.contains("RECOMMENDED") => Some(SowingStrategy::Outside),
+        (_, Some(ins)) if ins.contains("RECOMMENDED") => Some(SowingStrategy::Inside),
+        (Some(_), None) => Some(SowingStrategy::Outside), // Default to outside if no inside instructions
+        (None, Some(_)) => Some(SowingStrategy::Inside), // Default to inside if no outside instructions
+        (Some(_), Some(_)) => Some(SowingStrategy::Outside), // Default to outside if both are available but no recommendation
         _ => None,
     }
 }
 
-fn get_when_to_seed_start(info: &PlantInfo) -> Option<SowingTime> {
-    let strategy = determine_sowing_strategy(info);
+fn get_when_to_seed_start(
+    info: &PlantInfo,
+    user_strategy: Option<SowingStrategy>,
+) -> Option<SowingTime> {
+    // Use the default logic based on recommended strategy
+    let strategy = determine_sowing_strategy(info, user_strategy);
     let text = match strategy {
-        Some("Inside") => info.when_to_start_inside.as_deref(),
-        Some("Outside") => info.when_to_sow_outside.as_deref(),
-        _ => None,
+        Some(SowingStrategy::Inside) => info.when_to_start_inside.as_deref(),
+        Some(SowingStrategy::Outside) => info.when_to_sow_outside.as_deref(),
+        None => None,
     };
-
     text.and_then(extract_weeks_pattern)
 }
 
@@ -409,9 +437,10 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
     writer.write_record(&[
         "Plant Name",
         "URL",
-        "Brand",         // New column
-        "Purchase Year", // New column
-        "Notes",         // New column
+        "Brand",                 // New column
+        "Purchase Year",         // New column
+        "Notes",                 // New column
+        "Users Sowing Strategy", // New column to be preserved
         "Title",
         "Description",
         "Days to Maturity",
@@ -462,6 +491,15 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
         let purchase_year = record.get(3).unwrap_or("");
         let notes = record.get(4).unwrap_or("");
 
+        // Convert user strategy string to SowingStrategy enum
+        let user_strategy_str = record.get(5);
+        let user_strategy = user_strategy_str.and_then(|s| match s {
+            "Inside" => Some(SowingStrategy::Inside),
+            "Outside" => Some(SowingStrategy::Outside),
+            _ if s.trim().is_empty() => None,
+            _ => None,
+        });
+
         // Load the JSON file for this plant
         let json_path = format!("{}/{}.json", json_dir, plant.replace("/", "_"));
 
@@ -469,7 +507,14 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             eprintln!("Warning: No JSON data found for plant: {}", plant);
             // Write a row with just the input data and ERR for everything else
             let errors: Vec<&str> = vec!["ERR"; 24]; // 24 columns of scraped data
-            let mut row = vec![plant, url, brand, purchase_year, notes];
+            let mut row = vec![
+                plant,
+                url,
+                brand,
+                purchase_year,
+                notes,
+                user_strategy_str.unwrap_or(""),
+            ];
             row.extend(errors);
             writer.write_record(&row)?;
             missing_json_count += 1;
@@ -493,11 +538,11 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             }
         };
 
-        let sowing_strategy = determine_sowing_strategy(&info)
-            .map(String::from)
-            .unwrap_or_else(|| "NULL".to_string());
+        // Get the sowing strategy as an enum
+        let sowing_strategy = determine_sowing_strategy(&info, user_strategy.clone());
 
-        let when_to_start = get_when_to_seed_start(&info);
+        // Get the sowing time based on the strategy enum
+        let when_to_start = get_when_to_seed_start(&info, user_strategy);
 
         let when_to_start_str = when_to_start
             .as_ref()
@@ -553,6 +598,7 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             brand,
             purchase_year,
             notes,
+            user_strategy_str.unwrap_or(""),
             title,
             description,
             days_to_maturity,
@@ -573,7 +619,10 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
             thinning,
             rating,
             votes,
-            &sowing_strategy,
+            &sowing_strategy
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
             &when_to_start_str,
             &start_date,
         ])?;
@@ -850,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_get_when_to_seed_start() {
-        let mut info = PlantInfo {
+        let info = PlantInfo {
             url: "test".to_string(),
             title: None,
             description: None,
@@ -876,34 +925,62 @@ mod tests {
             votes: None,
         };
 
-        // Test outside sowing before frost
-        let result = get_when_to_seed_start(&info).unwrap();
+        // Test with no user strategy
+        let result = get_when_to_seed_start(&info, None).unwrap();
         assert_eq!(result.weeks_min, 2);
         assert_eq!(result.weeks_max, 4);
         assert!(matches!(result.relative_timing, RelativeTiming::Before));
         assert!(matches!(result.timing_type, TimingType::LastFrost));
 
-        // Test outside sowing after frost
-        info.when_to_sow_outside =
-            Some("1 to 2 weeks after your average last frost date".to_string());
-        let result = get_when_to_seed_start(&info).unwrap();
-        assert_eq!(result.weeks_min, 1);
-        assert_eq!(result.weeks_max, 2);
-        assert!(matches!(result.relative_timing, RelativeTiming::After));
-        assert!(matches!(result.timing_type, TimingType::LastFrost));
-
-        // Test inside sowing before transplant
-        info.when_to_start_inside =
-            Some("RECOMMENDED. 6 to 8 weeks before transplanting".to_string());
-        let result = get_when_to_seed_start(&info).unwrap();
+        // Add new test cases for user strategy
+        let result = get_when_to_seed_start(&info, Some(SowingStrategy::Inside)).unwrap();
         assert_eq!(result.weeks_min, 6);
         assert_eq!(result.weeks_max, 8);
         assert!(matches!(result.relative_timing, RelativeTiming::Before));
         assert!(matches!(result.timing_type, TimingType::Transplant));
+    }
 
-        // Test no pattern found
-        info.when_to_sow_outside = Some("Direct sow in spring".to_string());
-        info.when_to_start_inside = None;
-        assert!(get_when_to_seed_start(&info).is_none());
+    #[test]
+    fn test_determine_sowing_strategy() {
+        let mut info = PlantInfo {
+            url: "test".to_string(),
+            title: None,
+            description: None,
+            days_to_maturity: None,
+            family: None,
+            plant_type: None,
+            native: None,
+            hardiness: None,
+            exposure: None,
+            plant_dimensions: None,
+            variety_info: None,
+            attributes: None,
+            when_to_sow_outside: Some(
+                "RECOMMENDED. 2 to 4 weeks before your average last frost date".to_string(),
+            ),
+            when_to_start_inside: None,
+            days_to_emerge: None,
+            seed_depth: None,
+            seed_spacing: None,
+            row_spacing: None,
+            thinning: None,
+            rating: None,
+            votes: None,
+        };
+
+        // Test with outside recommended
+        let result = determine_sowing_strategy(&info, None);
+        assert_eq!(result, Some(SowingStrategy::Outside));
+
+        // Test with inside recommended
+        info.when_to_sow_outside = None;
+        info.when_to_start_inside =
+            Some("RECOMMENDED. 6 to 8 weeks before transplanting".to_string());
+        let result = determine_sowing_strategy(&info, None);
+        assert_eq!(result, Some(SowingStrategy::Inside));
+
+        // Test with user strategy overriding
+        let result = determine_sowing_strategy(&info, Some(SowingStrategy::Outside));
+        assert_eq!(result, Some(SowingStrategy::Outside));
     }
 }
