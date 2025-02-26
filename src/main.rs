@@ -26,9 +26,10 @@ enum Commands {
         #[arg(short, long)]
         file: String,
     },
+    /// Export data from JSON files to CSV, using input CSV for additional columns
     Export {
         #[arg(short, long)]
-        dir: String,
+        file: String,
     },
 }
 
@@ -227,6 +228,14 @@ fn process_csv(file_path: &str) -> Result<()> {
             }
         };
 
+        let file_name = format!("results/{}.json", plant.replace("/", "_"));
+
+        // Skip if file already exists
+        if Path::new(&file_name).exists() {
+            println!("Skipping {} - result file already exists", plant);
+            continue;
+        }
+
         println!("Processing {} from {}", plant, url);
 
         // Sleep between requests
@@ -260,7 +269,6 @@ fn process_csv(file_path: &str) -> Result<()> {
                     }
                 };
 
-                let file_name = format!("results/{}.json", plant.replace("/", "_"));
                 if let Err(e) = fs::write(&file_name, json) {
                     eprintln!("Failed to write file for {}: {}", plant, e);
                     failed_plants.push(plant.to_string());
@@ -338,6 +346,9 @@ fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
     match (outside, inside) {
         (Some(out), _) if out.contains("RECOMMENDED") => Some("Outside"),
         (_, Some(ins)) if ins.contains("RECOMMENDED") => Some("Inside"),
+        (Some(_), None) => Some("Outside"), // Default to outside if no inside instructions
+        (None, Some(_)) => Some("Inside"),  // Default to inside if no outside instructions
+        (Some(_), Some(_)) => Some("Outside"), // Default to outside if both are available but no recommendation
         _ => None,
     }
 }
@@ -345,8 +356,9 @@ fn determine_sowing_strategy(info: &PlantInfo) -> Option<&'static str> {
 fn get_when_to_seed_start(info: &PlantInfo) -> Option<SowingTime> {
     let strategy = determine_sowing_strategy(info);
     let text = match strategy {
+        Some("Inside") => info.when_to_start_inside.as_deref(),
         Some("Outside") => info.when_to_sow_outside.as_deref(),
-        _ => info.when_to_start_inside.as_deref(), // Default to inside instructions
+        _ => None,
     };
 
     text.and_then(extract_weeks_pattern)
@@ -364,18 +376,25 @@ fn calculate_start_date(sowing_time: &SowingTime, frost_date: NaiveDate) -> Naiv
     }
 }
 
-fn export_to_csv(dir: &str) -> Result<()> {
-    let dir_path = Path::new(dir);
-    if !dir_path.exists() {
-        return Err(anyhow::anyhow!("Directory {} does not exist", dir));
+fn export_to_csv(file_path: &str) -> Result<()> {
+    let results_dir = Path::new("results");
+    if !results_dir.exists() {
+        return Err(anyhow::anyhow!("Results directory does not exist"));
     }
+
+    // Read the input CSV file
+    let mut input_rdr = csv::Reader::from_path(file_path)
+        .context(format!("Failed to read input CSV file: {}", file_path))?;
 
     let mut writer = csv::Writer::from_path("export.csv")?;
 
-    // Write headers
+    // Write headers - include the original columns plus the scraped data
     writer.write_record(&[
         "Plant Name",
         "URL",
+        "Brand",         // New column
+        "Purchase Year", // New column
+        "Notes",         // New column
         "Title",
         "Description",
         "Days to Maturity",
@@ -403,78 +422,137 @@ fn export_to_csv(dir: &str) -> Result<()> {
 
     let frost_date = NaiveDate::from_ymd_opt(2025, 5, 10).unwrap();
 
-    for entry in fs::read_dir(dir_path)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
-            let content = fs::read_to_string(entry.path())?;
-            let info: PlantInfo = serde_json::from_str(&content)?;
+    // Process each row in the input CSV
+    for result in input_rdr.records() {
+        let record = match result {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("Error reading CSV record: {}", e);
+                continue;
+            }
+        };
 
-            let plant_name = entry
-                .path()
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .replace("_", "/");
+        // Get values from the input CSV
+        let plant = record.get(0).unwrap_or("unknown");
+        let url = record.get(1).unwrap_or("");
+        let brand = record.get(2).unwrap_or("");
+        let purchase_year = record.get(3).unwrap_or("");
+        let notes = record.get(4).unwrap_or("");
 
-            let sowing_strategy = determine_sowing_strategy(&info)
-                .map(String::from)
-                .unwrap_or_else(|| "NULL".to_string());
+        // Load the JSON file for this plant
+        let json_path = format!("results/{}.json", plant.replace("/", "_"));
 
-            let when_to_start = get_when_to_seed_start(&info);
-
-            let when_to_start_str = when_to_start
-                .as_ref()
-                .map(|sowing_time| {
-                    let relative = match sowing_time.relative_timing {
-                        RelativeTiming::Before => "before",
-                        RelativeTiming::After => "after",
-                    };
-                    let timing = match sowing_time.timing_type {
-                        TimingType::LastFrost => "LAST_FROST",
-                        TimingType::Transplant => "TRANSPLANT",
-                    };
-                    format!(
-                        "{}-{} {} {}",
-                        sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
-                    )
-                })
-                .unwrap_or_else(|| "NULL".to_string());
-
-            let start_date = when_to_start
-                .map(|t| calculate_start_date(&t, frost_date))
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "NULL".to_string());
-
-            writer.write_record(&[
-                plant_name,
-                info.url,
-                info.title.unwrap_or_else(|| "NULL".to_string()),
-                info.description.unwrap_or_else(|| "NULL".to_string()),
-                info.days_to_maturity.unwrap_or_else(|| "NULL".to_string()),
-                info.family.unwrap_or_else(|| "NULL".to_string()),
-                info.plant_type.unwrap_or_else(|| "NULL".to_string()),
-                info.native.unwrap_or_else(|| "NULL".to_string()),
-                info.hardiness.unwrap_or_else(|| "NULL".to_string()),
-                info.exposure.unwrap_or_else(|| "NULL".to_string()),
-                info.plant_dimensions.unwrap_or_else(|| "NULL".to_string()),
-                info.variety_info.unwrap_or_else(|| "NULL".to_string()),
-                info.attributes.unwrap_or_else(|| "NULL".to_string()),
-                info.when_to_sow_outside
-                    .unwrap_or_else(|| "NULL".to_string()),
-                info.when_to_start_inside
-                    .unwrap_or_else(|| "NULL".to_string()),
-                info.days_to_emerge.unwrap_or_else(|| "NULL".to_string()),
-                info.seed_depth.unwrap_or_else(|| "NULL".to_string()),
-                info.seed_spacing.unwrap_or_else(|| "NULL".to_string()),
-                info.row_spacing.unwrap_or_else(|| "NULL".to_string()),
-                info.thinning.unwrap_or_else(|| "NULL".to_string()),
-                info.rating.map_or("NULL".to_string(), |r| r.to_string()),
-                info.votes.map_or("NULL".to_string(), |v| v.to_string()),
-                sowing_strategy,
-                when_to_start_str,
-                start_date,
-            ])?;
+        if !Path::new(&json_path).exists() {
+            eprintln!("Warning: No JSON data found for plant: {}", plant);
+            // Write a row with just the input data and NULL for everything else
+            let nulls: Vec<&str> = vec!["NULL"; 24]; // 24 columns of scraped data
+            let mut row = vec![plant, url, brand, purchase_year, notes];
+            row.extend(nulls);
+            writer.write_record(&row)?;
+            continue;
         }
+
+        // Read and parse the JSON file
+        let content = match fs::read_to_string(&json_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Failed to read JSON file for {}: {}", plant, e);
+                continue;
+            }
+        };
+
+        let info: PlantInfo = match serde_json::from_str(&content) {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("Failed to parse JSON for {}: {}", plant, e);
+                continue;
+            }
+        };
+
+        let sowing_strategy = determine_sowing_strategy(&info)
+            .map(String::from)
+            .unwrap_or_else(|| "NULL".to_string());
+
+        let when_to_start = get_when_to_seed_start(&info);
+
+        let when_to_start_str = when_to_start
+            .as_ref()
+            .map(|sowing_time| {
+                let relative = match sowing_time.relative_timing {
+                    RelativeTiming::Before => "before",
+                    RelativeTiming::After => "after",
+                };
+                let timing = match sowing_time.timing_type {
+                    TimingType::LastFrost => "LAST_FROST",
+                    TimingType::Transplant => "TRANSPLANT",
+                };
+                format!(
+                    "{}-{} {} {}",
+                    sowing_time.weeks_min, sowing_time.weeks_max, relative, timing
+                )
+            })
+            .unwrap_or_else(|| "NULL".to_string());
+
+        let start_date = when_to_start
+            .map(|t| calculate_start_date(&t, frost_date))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "NULL".to_string());
+
+        let title = info.title.as_deref().unwrap_or("NULL");
+        let description = info.description.as_deref().unwrap_or("NULL");
+        let days_to_maturity = info.days_to_maturity.as_deref().unwrap_or("NULL");
+        let family = info.family.as_deref().unwrap_or("NULL");
+        let plant_type = info.plant_type.as_deref().unwrap_or("NULL");
+        let native = info.native.as_deref().unwrap_or("NULL");
+        let hardiness = info.hardiness.as_deref().unwrap_or("NULL");
+        let exposure = info.exposure.as_deref().unwrap_or("NULL");
+        let plant_dimensions = info.plant_dimensions.as_deref().unwrap_or("NULL");
+        let variety_info = info.variety_info.as_deref().unwrap_or("NULL");
+        let attributes = info.attributes.as_deref().unwrap_or("NULL");
+        let when_to_sow_outside = info.when_to_sow_outside.as_deref().unwrap_or("NULL");
+        let when_to_start_inside = info.when_to_start_inside.as_deref().unwrap_or("NULL");
+        let days_to_emerge = info.days_to_emerge.as_deref().unwrap_or("NULL");
+        let seed_depth = info.seed_depth.as_deref().unwrap_or("NULL");
+        let seed_spacing = info.seed_spacing.as_deref().unwrap_or("NULL");
+        let row_spacing = info.row_spacing.as_deref().unwrap_or("NULL");
+        let thinning = info.thinning.as_deref().unwrap_or("NULL");
+
+        // Create owned strings for these values to avoid referencing temporary values
+        let rating_str = info.rating.map_or("NULL".to_string(), |r| r.to_string());
+        let votes_str = info.votes.map_or("NULL".to_string(), |v| v.to_string());
+        let rating = rating_str.as_str();
+        let votes = votes_str.as_str();
+
+        writer.write_record(&[
+            plant,
+            url,
+            brand,
+            purchase_year,
+            notes,
+            title,
+            description,
+            days_to_maturity,
+            family,
+            plant_type,
+            native,
+            hardiness,
+            exposure,
+            plant_dimensions,
+            variety_info,
+            attributes,
+            when_to_sow_outside,
+            when_to_start_inside,
+            days_to_emerge,
+            seed_depth,
+            seed_spacing,
+            row_spacing,
+            thinning,
+            rating,
+            votes,
+            &sowing_strategy,
+            &when_to_start_str,
+            &start_date,
+        ])?;
     }
 
     writer.flush()?;
@@ -518,8 +596,8 @@ fn main() -> Result<()> {
         Commands::Batch { file } => {
             process_csv(&file)?;
         }
-        Commands::Export { dir } => {
-            export_to_csv(&dir)?;
+        Commands::Export { file } => {
+            export_to_csv(&file)?;
         }
     }
 
