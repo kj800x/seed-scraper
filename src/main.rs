@@ -229,7 +229,12 @@ fn process_csv(file_path: &str, json_dir: &str) -> Result<()> {
 
         let plant = record.get(0).unwrap_or("unknown");
         let url = match record.get(1) {
-            Some(url) => url,
+            Some(url) if !url.trim().is_empty() => url,
+            Some(_) => {
+                eprintln!("Empty URL for plant: {}", plant);
+                failed_plants.push(plant.to_string());
+                continue;
+            }
             None => {
                 eprintln!("Missing URL for plant: {}", plant);
                 failed_plants.push(plant.to_string());
@@ -448,7 +453,11 @@ fn export_to_csv(input_file: &str, output_file: &str, json_dir: &str) -> Result<
 
         // Get values from the input CSV
         let plant = record.get(0).unwrap_or("unknown");
+
+        // We don't need to reject empty URLs in the export process,
+        // just read what's there (even if it's empty)
         let url = record.get(1).unwrap_or("");
+
         let brand = record.get(2).unwrap_or("");
         let purchase_year = record.get(3).unwrap_or("");
         let notes = record.get(4).unwrap_or("");
